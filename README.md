@@ -21,8 +21,9 @@ A single Python file. No dependencies, no accounts, no server. Your usage data n
 | **Usage chart** | **Tokens, cost or commits** (with/without AI), hourly (48h) or daily (30d), per tool, with **limit hits** (dashed lines) and **Claude incidents** (red bands) marked |
 | **Claude status** | Live component status and the last 30 days of incidents from status.claude.com |
 | **When you work** | Weekday × hour heatmap of your token use, with your peak hour, busiest day and active days |
-| **Recent sessions** | Your last 20 sessions across all tools: project, start time, length, calls, tokens, cost, model |
-| **Models / projects** | Tokens and cost by model; tokens, cost and commits by project |
+| **Recent sessions** | Your last 20 sessions across all tools. **Click one** for a request-by-request timeline, cache hit rate, cost, models and the Claude Code tools it used (edits, reads, terminal commands…) |
+| **Models / projects** | Tokens and cost by model, with a **tip** when a big model is doing lots of small jobs; tokens, cost and commits by project |
+| **Pace forecasts** | When you'll hit your Claude 5h limit at this hour's pace, where Codex's 5h and weekly limits will land by reset, this week vs your 3-week average, and a projected bar for the rest of today |
 | **Price ticker** | Your choice of coins in your choice of currency, with 24h change and a 7-day sparkline; drag the slim track underneath, or use the mouse wheel, when they don't all fit |
 | **⚙ Settings** | Switches for each tracker, crypto prices and the moving background, plus a coin picker (top-right of the page) |
 
@@ -48,6 +49,20 @@ A single Python file. No dependencies, no accounts, no server. Your usage data n
 **Cursor isn't supported.** It keeps usage on Cursor's servers, not on your machine. The only way to read it locally is to take Cursor's saved login token, and a tool like this shouldn't do that.
 
 The dashboard keeps its own history in `~/.ai-usage/usage.db`. That means it keeps working after a tool deletes old logs; Claude Code, for example, removes logs after 30 days.
+
+## Menu bar meter (macOS / Linux)
+
+See your limits without opening the page: Claude and Codex % in the menu bar, with a dropdown of your key numbers, pace warnings, *Open dashboard* and *Refresh now*. The title turns red at 85%.
+
+On macOS it runs in [SwiftBar](https://swiftbar.app) (or xbar):
+
+```bash
+brew install --cask swiftbar         # or download it from swiftbar.app
+# open SwiftBar once and choose a plugin folder, then:
+python3 usage.py --install-menubar
+```
+
+On Linux (GNOME) it uses the Argos extension: create `~/.config/argos`, then run the same command. Pass a folder explicitly if yours is elsewhere: `--install-menubar ~/path/to/plugins`. The meter re-reads your data every 2 minutes; keep `--install` on so the data itself stays fresh. To remove it, delete `build-commit-pro.2m.sh` from the plugin folder.
 
 ## Git activity
 
@@ -183,6 +198,8 @@ Click **⚙ Settings** (top-right). You can:
 
 - turn individual trackers on or off (hidden tools disappear from every card, chart and table)
 - turn commit tracking on or off, and switch between *only my commits* and everyone's
+- **Screenshot mode:** replaces every project and repo name with *Project A*, *Project B*… so you can share the dashboard safely (names are swapped, not blurred)
+- **Export** the last 30 days as a daily CSV or a full JSON file (names hidden too if screenshot mode is on)
 - show or hide crypto prices
 - stop the moving background
 - pick which coins appear in the ticker, from about 24 popular coins
@@ -206,6 +223,7 @@ python3 usage.py --unset coins                    # back to the default
 | `currency` | `USD` | Currency for the price ticker (USD, GBP, EUR, JPY, …) |
 | `coins` | `SOL,BTC,ETH,XMR,BNB,XRP,LINK` | Coins shown in the ticker. Common symbols just work; for others, give the CoinGecko id: `WIF:dogwifcoin`. The popular coins in the page's picker are always fetched too, in the same single request |
 | `show_prices` | `true` | `false` hides the ticker and stops price requests |
+| `screenshot_mode` | `false` | Start with project and repo names hidden (also applies to `--export`) |
 | `hidden_tools` | none | Tools hidden on the dashboard by default, e.g. `--set 'hidden_tools=["Hermes"]'` (use `"Git"` to hide commits) |
 | `git.enabled` | `true` | Read git history at all |
 | `git.author` | `me` | Default commit view: `me` (your `user.email` in each repo) or `all` |
@@ -256,6 +274,9 @@ Keys are stored only on your machine, in `~/.ai-usage/config.json` (on macOS and
 | `usage.py --cmc-key KEY` | Save a CoinMarketCap API key |
 | `usage.py --coingecko-key KEY` | Save a CoinGecko demo API key |
 | `usage.py --test-alert` | Send a test desktop notification |
+| `usage.py --export [FOLDER]` | Write every request and commit to CSV, plus a JSON summary |
+| `usage.py --install-menubar [FOLDER]` | Add the menu bar meter to SwiftBar / xbar / Argos |
+| `usage.py --menubar` | Print the menu bar output (used by the plugin) |
 | `usage.py --offline` | Skip the status and price requests |
 | `usage.py --inspect-hermes` | Show the Hermes database layout (for troubleshooting) |
 | `usage.py --version` | Print the version |
@@ -266,7 +287,7 @@ If you move `usage.py` after running `--install`, run `--install` again from the
 
 - The only network requests are to `status.claude.com` (service status), `pro-api.coinmarketcap.com` / `api.coingecko.com` (prices), and Google Fonts and cdnjs (page fonts and the chart library). Use `--offline` to skip status and prices, or `--set show_prices=false` to drop prices for good.
 - Your token counts, project names, session history and commit counts stay in `~/.ai-usage/` on your machine. The script only reads other tools' files and your repos; it never changes them.
-- **Before sharing a screenshot,** check the *Recent sessions* and *Projects* panels. They show your project folder names.
+- **Before sharing a screenshot,** turn on *Screenshot mode* in ⚙ Settings, which swaps project and repo names for *Project A*, *Project B*…
 
 ## Troubleshooting
 
@@ -284,7 +305,7 @@ If you move `usage.py` after running `--install`, run `--install` again from the
 `SHA256SUMS` contains the SHA-256 hash of `usage.py` for this release:
 
 ```
-f44bc0da29bb403842d428eaa445c368e55ef818184a28c26fa9dbb1289d6ac0  usage.py
+39da02cdca7c7f2064f5c5a51b30b1d6e619acd6bd821c322e4a748f7a873548  usage.py
 ```
 
 If the hash of your file doesn't match, don't run it. Download it again from this repo.

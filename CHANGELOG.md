@@ -1,5 +1,27 @@
 # Changelog
 
+## v2.9.1
+
+- **Menu bar meter:**
+  - info lines are now clickable (they open the dashboard), so they show in normal text instead of greyed out
+  - when there's no Claude usage in the last 5 hours, the menu bar shows your 7-day total (e.g. *CC 7d 65k*) instead of *CC 0*
+
+## v2.9
+
+- **Screenshot mode:** one switch swaps every project and repo name for *Project A*, *Project B*… (replaced, not blurred), including in exports. Settable as a default with `screenshot_mode`.
+- **Menu bar meter:** Claude and Codex % in the macOS menu bar (SwiftBar/xbar) or GNOME top bar (Argos), with key numbers, pace warnings, *Open dashboard* and *Refresh now*. Set up with `--install-menubar`.
+- **Export:**
+  - *Daily CSV* and *Full JSON* buttons in ⚙ Settings
+  - `--export [FOLDER]` writes every request and commit to CSV, plus a JSON summary
+- **Pace forecasts:**
+  - when you'll hit your Claude 5h limit at this hour's pace
+  - where Codex's 5h and weekly limits will land by reset, and when they'd be hit
+  - this week vs your 3-week average
+  - a projected bar for the rest of today on the daily chart
+- **Session drill-down:** click any session for a per-request token timeline, cache hit rate, API value, models, and the Claude Code tools it used.
+- **Model advice:** a tip in *Models* when a big model (Opus, Fable/Mythos, GPT-5.5-class) did many small jobs, with the estimated saving on the smaller model.
+- Claude Code tool names are now recorded per request (history before this version has none).
+
 ## v2.8
 
 - **Easier-to-read title:** bold monospace instead of the pixel font, with a soft dark halo so the moving background no longer cuts through the letters. The ampersand picks up your accent colour.
