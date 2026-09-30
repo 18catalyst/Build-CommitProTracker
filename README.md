@@ -38,7 +38,7 @@ Your Claude limits are shared across Claude Code **and** the Claude app and clau
 
 | Tool | Where it reads from | Override |
 |---|---|---|
-| Claude Code | `~/.claude/projects/` (or `~/.config/claude/projects/`) | n/a |
+| Claude Code | `~/.claude/projects/` (or `~/.config/claude/projects/`), plus Hermes' sandboxes under `~/.hermes/sandboxes/` | `HERMES_HOME` for the sandboxes |
 | Codex CLI | `~/.codex/sessions/` | `CODEX_HOME` |
 | Hermes Agent | `~/.hermes/state.db` | `HERMES_HOME` |
 | Gemini CLI | `~/.gemini/tmp/*/chats/` | `GEMINI_DATA_DIR` (comma-separated) |
@@ -67,6 +67,7 @@ The dashboard also reads the git history of the projects your AI tools work in, 
   - a commit with a `Co-Authored-By:` line naming Claude, Codex, Gemini, OpenCode, Copilot or Cursor
   - a commit Aider made (author ends in `(aider)`)
   - a commit with Claude Code's *Generated with Claude Code* footer
+  - one of your own commits made within 30 minutes of an AI tool working in that repo (or in a sandbox or chat that isn't tied to a repo). This covers commits you make by hand from what the AI prepared, which carry no trailer
 - **What it shows:**
   - a *Commits · 30d* card (hover it for lines changed and API cost per commit)
   - a *Commits* view on the usage chart
@@ -321,7 +322,7 @@ If you move `usage.py` after running `--install`, run `--install` again from the
 `SHA256SUMS` contains the SHA-256 hash of `usage.py` for this release:
 
 ```
-879e99384606aad9283336d0f7ee03848daf6cc8a42367d0f457be168e996dc2  usage.py
+646ddc7b09c2f59b06287951dc33ecf95117df520ae53704a68de67fa3bccd58  usage.py
 ```
 
 If the hash of your file doesn't match, don't run it. Download it again from this repo.

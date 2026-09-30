@@ -29,7 +29,7 @@ import argparse, copy, json, os, platform, re, shlex, shutil, sqlite3, statistic
 from datetime import datetime, timedelta
 from pathlib import Path
 
-VERSION = "2.9.5"  # bump on every change so the page and Terminal show which copy is running
+VERSION = "2.9.6"  # bump on every change so the page and Terminal show which copy is running
 
 HOME = Path.home()
 DATA_DIR = HOME / ".ai-usage"
@@ -37,9 +37,11 @@ DB_PATH = DATA_DIR / "usage.db"
 OUT_HTML = DATA_DIR / "dashboard.html"
 CONFIG_PATH = DATA_DIR / "config.json"
 
-CLAUDE_DIRS = [HOME / ".claude" / "projects", HOME / ".config" / "claude" / "projects"]
 CODEX_DIR = Path(os.environ.get("CODEX_HOME", HOME / ".codex")) / "sessions"
 HERMES_HOME = Path(os.environ.get("HERMES_HOME", HOME / ".hermes"))
+# Claude Code's own logs, plus the copies it keeps inside Hermes' sandboxes when Hermes runs it there
+CLAUDE_DIRS = [HOME / ".claude" / "projects", HOME / ".config" / "claude" / "projects",
+               *sorted(HERMES_HOME.glob("sandboxes/*/*/home/.claude/projects"))]
 OPENCODE_DIR = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local" / "share") / "opencode"
 
 
@@ -943,6 +945,13 @@ def store(rows, events, meta):
     con.executemany("INSERT OR REPLACE INTO usage(id,ts,source,model,input,output,cache_write,cache_read,project,session,cost,tools) "
                     "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", [tuple(r) + (None,) * (12 - len(r)) for r in rows if r[1] is not None])
     con.executemany("INSERT OR REPLACE INTO events VALUES (?,?,?,?)", events)
+    # Commits made by hand carry no AI trailer: count one as AI-assisted when a tool was working up to 30 minutes before it,
+    # either in that repo or somewhere we can't tie to a repo (a sandbox, a chat), but not in a different tracked repo.
+    con.execute("""UPDATE commits SET ai = (
+        SELECT REPLACE(REPLACE(u.source, ' Code', ''), ' CLI', '') FROM usage u
+        WHERE u.ts BETWEEN commits.ts - 1800 AND commits.ts
+          AND (u.project = commits.repo OR u.project NOT IN (SELECT repo FROM commits))
+        ORDER BY u.ts DESC LIMIT 1) WHERE ai IS NULL AND mine = 1""")
     for k, v in meta.items():
         if v is not None:
             con.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (k, json.dumps(v)))
@@ -1820,7 +1829,7 @@ function renderCards(){
   if(gitOn()){
     const g=gitStats(), pct=g.n?Math.round(g.ai/g.n*100):0, apiv=vs.reduce((a,s)=>a+D.cost30[s],0);
     const tools=Object.entries(g.tool).sort((a,b)=>b[1]-a[1]).map(([t,n])=>`${t} ${n}`).join(", ");
-    h += `<div class="card" title="+${g.added.toLocaleString()} / −${g.deleted.toLocaleString()} lines · ${tools?"AI-assisted: "+esc(tools):"no AI co-authored commits"}${g.n&&apiv?` · ${usd(apiv/g.n)} of API usage per commit`:""}"><div class="lbl"><span class="dot" style="background:var(--edge-hi)"></span>Commits · 30d</div>
+    h += `<div class="card" title="+${g.added.toLocaleString()} / −${g.deleted.toLocaleString()} lines · ${tools?"AI-assisted: "+esc(tools):"no AI-assisted commits"}${g.n&&apiv?` · ${usd(apiv/g.n)} of API usage per commit`:""}"><div class="lbl"><span class="dot" style="background:var(--edge-hi)"></span>Commits · 30d</div>
       <div class="big">${g.n}</div><div class="small">${pct}% with AI · <span class="up">+${fmt(g.added)}</span> <span class="down">−${fmt(g.deleted)}</span></div>
       ${sparkSvg(D.days.slice(-14).map(d=>g.daily[d][0]+g.daily[d][1]),css("var(--edge-hi)"))}</div>`;
   }

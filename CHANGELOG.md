@@ -1,5 +1,10 @@
 # Changelog
 
+## v2.9.6
+
+- **Claude Code inside Hermes is now counted:** when Hermes runs Claude Code in its sandbox, the logs live under `~/.hermes/sandboxes/` rather than `~/.claude/projects/`, so that usage was missing. Both places are read now. Sandbox sessions show under the project *workspace*.
+- **Hand-made commits count as AI-assisted:** if you commit yourself from what an AI tool prepared, there's no `Co-Authored-By` line to go on. One of your own commits now counts as AI-assisted when a tool was working in that repo (or in a sandbox or chat not tied to a repo) in the 30 minutes before it.
+
 ## v2.9.5
 
 - **Hermes costs fixed:** when Hermes reports $0 for real usage (typically a model running on a subscription), the API value now comes from list prices instead of counting as free. Hermes history is rebuilt once so the correction applies to past days too.
