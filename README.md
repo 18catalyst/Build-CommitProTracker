@@ -7,7 +7,7 @@ A local dashboard for your AI coding tools. It reads the usage logs that **Claud
 - how close you are to your limits, with desktop alerts before you hit them
 - how that usage turns into **git commits**: how many, how many were AI-assisted, and the API cost per commit
 
-The page also shows live **Claude service status** and a **crypto price ticker**.
+The page also shows live **Claude service status** and a **crypto price ticker**, and there's an optional **menu bar meter** for macOS and Linux.
 
 A single Python file. No dependencies, no accounts, no server. Your usage data never leaves your computer.
 
@@ -18,17 +18,21 @@ A single Python file. No dependencies, no accounts, no server. Your usage data n
 | Section | What you get |
 |---|---|
 | **Stat cards** | Claude tokens in the last 5 hours and 7 days, **API value** of your usage over 30 days, cache hit rate, Codex 5h/weekly limit %, the other tools you use, **commits** in 30 days |
-| **Usage chart** | **Tokens, cost or commits** (with/without AI), hourly (48h) or daily (30d), per tool, with **limit hits** (dashed lines) and **Claude incidents** (red bands) marked |
+| **Usage chart** | **Tokens, cost or commits** (with/without AI) over **24h, 48h or 72h** (hourly) or **7, 14 or 30 days** (daily), per tool, with **limit hits** (dashed lines) and **Claude incidents** (red bands) marked |
 | **Claude status** | Live component status and the last 30 days of incidents from status.claude.com |
 | **When you work** | Weekday × hour heatmap of your token use, with your peak hour, busiest day and active days |
-| **Recent sessions** | Your last 20 sessions across all tools: project, start time, length, calls, tokens, cost, model |
-| **Models / projects** | Tokens and cost by model; tokens, cost and commits by project |
+| **Recent sessions** | Your last 20 sessions across all tools. **Click one** for a request-by-request timeline, cache hit rate, cost, models and the Claude Code tools it used (edits, reads, terminal commands…) |
+| **Models / projects** | Tokens and cost by model, with a **tip** when a big model is doing lots of small jobs; tokens, cost and commits by project |
+| **Pace forecasts** | When you'll hit your Claude 5h limit at this hour's pace, where Codex's 5h and weekly limits will land by reset, this week vs your 3-week average, and a projected bar for the rest of today |
 | **Price ticker** | Your choice of coins in your choice of currency, with 24h change and a 7-day sparkline; drag the slim track underneath, or use the mouse wheel, when they don't all fit |
-| **⚙ Settings** | Switches for each tracker, crypto prices and the moving background, plus a coin picker (top-right of the page) |
+| **⚙ Settings** | Switches for each tracker, git tracking, screenshot mode, crypto prices and the moving background, a coin picker, and CSV/JSON export (top-right of the page) |
+| **Menu bar meter** *(optional)* | Claude and Codex % in your macOS or Linux menu bar; see [Menu bar meter](#menu-bar-meter-optional) |
 
 **On limits:** Anthropic doesn't publish token limits for Claude subscriptions. So the 5-hour gauge compares against the usage level where you *actually* hit a limit, once that has happened at least once. Until then it compares against your busiest 5-hour window. Codex percentages come straight from Codex's own rate-limit reports.
 
-**On cost:** the dashboard prices every model call at the provider's public API rates. If you're on a subscription (Claude Pro/Max, ChatGPT Plus/Pro), that's not what you pay. It's what the same usage would cost you on the API, which shows how much value you're getting from the plan. Add your plan prices (see *Settings*) and the cost card shows the ratio. Aider and OpenCode report their own cost figures, and those are used where present.
+Your Claude limits are shared across Claude Code **and** the Claude app and claude.ai, but only Claude Code leaves logs on your machine, so the dashboard can't see app usage. For the full picture, check *Settings → Usage* in Claude. The Claude 5h forecast and the 85% alert start once Claude Code has hit a limit at least once.
+
+**On cost:** the dashboard prices every model call at the provider's public API rates. If you're on a subscription (Claude Pro/Max, ChatGPT Plus/Pro), that's not what you pay. It's what the same usage would cost you on the API, which shows how much value you're getting from the plan. Add your plan prices (see *Settings*) and the cost card shows the ratio. Hermes, Aider and OpenCode report their own cost figures, and those are used where present. A $0 figure (usually a subscription) is valued at list prices instead.
 
 ## Supported tools
 
@@ -42,6 +46,10 @@ A single Python file. No dependencies, no accounts, no server. Your usage data n
 | Aider | `.aider.chat.history.md` in your project folders | the `aider_dirs` setting |
 
 `~` means your home folder; on Windows that's `C:\Users\<you>`. Hermes Agent runs under WSL on Windows, so run the script inside WSL to include it.
+
+**Hermes** keeps a running total for each chat, and chats can stay open for days (for example through its Telegram gateway). At each refresh the dashboard records how much each chat has grown, dated at its latest activity, so today's work shows up today even in a chat that started last week.
+
+**Not trackable:** chats in the Claude, ChatGPT or Gemini apps and websites. They run on the providers' servers and leave nothing on your machine.
 
 **Aider** writes its history into each project rather than one central place. By default the script looks up to four folders deep in `~/code`, `~/projects`, `~/dev`, `~/src`, `~/repos`, `~/Documents/GitHub` and `~/tools`. Add your own with `--set aider_dirs=~/work,~/code`.
 
@@ -70,8 +78,11 @@ Only numbers are kept (date, repo name, lines added and removed, files changed, 
 
 - **Python 3.9 or newer.** Nothing to `pip install`.
 - At least one of the tools above, used on this machine.
-- `git` on your PATH for commit tracking (optional).
 - A web browser.
+- Optional:
+  - `git` on your PATH, for commit tracking
+  - [SwiftBar](https://swiftbar.app) or xbar (macOS), or Argos (Linux), for the menu bar meter
+  - `notify-send` (Linux), for desktop alerts
 
 ## Install and run
 
@@ -154,7 +165,7 @@ Cloned it back when it was called *Claude & Codex Token Tracker*? Your clone kee
 python3 usage.py          # refresh the data and open the dashboard (Windows: py usage.py)
 ```
 
-Or open the last saved copy directly: `~/.ai-usage/dashboard.html` (Windows: `%USERPROFILE%\.ai-usage\dashboard.html`).
+Or open the last saved copy directly: `~/.ai-usage/dashboard.html` (Windows: `%USERPROFILE%\.ai-usage\dashboard.html`). If you use the menu bar meter, its *Open dashboard* item does the same.
 
 With `--install` turned on, the data refreshes in the background every 15 minutes by default. An open dashboard tab reloads itself on the same schedule. Status and prices update live while the page is open.
 
@@ -175,6 +186,25 @@ python3 usage.py --test-alert
 
 On macOS the first notification may ask for permission; allow it under *System Settings → Notifications*. Change thresholds or turn alerts off in *Settings* below.
 
+## Menu bar meter (optional)
+
+Not needed for anything else: the dashboard, alerts and background refresh all work without it. If you'd like your limits at a glance, it puts Claude and Codex % in the menu bar with a dropdown of key numbers, pace warnings, *Open dashboard* and *Refresh now*. The text turns red at 85%; when you've had no Claude Code use in 5 hours it shows your 7-day total instead.
+
+It needs a small free menu bar app:
+
+- **macOS:** [SwiftBar](https://swiftbar.app) (or xbar)
+  ```bash
+  brew install --cask swiftbar     # or download it from swiftbar.app
+  ```
+  Open SwiftBar once and choose a plugin folder, then:
+  ```bash
+  python3 usage.py --install-menubar
+  ```
+- **Linux (GNOME):** the Argos extension. Create `~/.config/argos`, then run the same command.
+- **Windows:** not available.
+
+If the command can't find your plugin folder, pass it: `python3 usage.py --install-menubar ~/Documents/SwiftBar`. The meter re-reads your data every 2 minutes; keep `--install` on so the data itself stays fresh. To remove it, delete `build-commit-pro.2m.sh` from the plugin folder.
+
 ## Settings
 
 ### On the page
@@ -183,6 +213,8 @@ Click **⚙ Settings** (top-right). You can:
 
 - turn individual trackers on or off (hidden tools disappear from every card, chart and table)
 - turn commit tracking on or off, and switch between *only my commits* and everyone's
+- **Screenshot mode:** replaces every project and repo name with *Project A*, *Project B*… so you can share the dashboard safely (names are swapped, not blurred)
+- **Export** the last 30 days as a daily CSV or a full JSON file (names hidden too if screenshot mode is on)
 - show or hide crypto prices
 - stop the moving background
 - pick which coins appear in the ticker, from about 24 popular coins
@@ -206,6 +238,7 @@ python3 usage.py --unset coins                    # back to the default
 | `currency` | `USD` | Currency for the price ticker (USD, GBP, EUR, JPY, …) |
 | `coins` | `SOL,BTC,ETH,XMR,BNB,XRP,LINK` | Coins shown in the ticker. Common symbols just work; for others, give the CoinGecko id: `WIF:dogwifcoin`. The popular coins in the page's picker are always fetched too, in the same single request |
 | `show_prices` | `true` | `false` hides the ticker and stops price requests |
+| `screenshot_mode` | `false` | Start with project and repo names hidden (also applies to `--export`) |
 | `hidden_tools` | none | Tools hidden on the dashboard by default, e.g. `--set 'hidden_tools=["Hermes"]'` (use `"Git"` to hide commits) |
 | `git.enabled` | `true` | Read git history at all |
 | `git.author` | `me` | Default commit view: `me` (your `user.email` in each repo) or `all` |
@@ -256,6 +289,9 @@ Keys are stored only on your machine, in `~/.ai-usage/config.json` (on macOS and
 | `usage.py --cmc-key KEY` | Save a CoinMarketCap API key |
 | `usage.py --coingecko-key KEY` | Save a CoinGecko demo API key |
 | `usage.py --test-alert` | Send a test desktop notification |
+| `usage.py --export [FOLDER]` | Write every request and commit to CSV, plus a JSON summary |
+| `usage.py --install-menubar [FOLDER]` | Optional: add the menu bar meter to SwiftBar / xbar / Argos |
+| `usage.py --menubar` | Print the menu bar output (used by the menu bar plugin) |
 | `usage.py --offline` | Skip the status and price requests |
 | `usage.py --inspect-hermes` | Show the Hermes database layout (for troubleshooting) |
 | `usage.py --version` | Print the version |
@@ -266,7 +302,7 @@ If you move `usage.py` after running `--install`, run `--install` again from the
 
 - The only network requests are to `status.claude.com` (service status), `pro-api.coinmarketcap.com` / `api.coingecko.com` (prices), and Google Fonts and cdnjs (page fonts and the chart library). Use `--offline` to skip status and prices, or `--set show_prices=false` to drop prices for good.
 - Your token counts, project names, session history and commit counts stay in `~/.ai-usage/` on your machine. The script only reads other tools' files and your repos; it never changes them.
-- **Before sharing a screenshot,** check the *Recent sessions* and *Projects* panels. They show your project folder names.
+- **Before sharing a screenshot,** turn on *Screenshot mode* in ⚙ Settings, which swaps project and repo names for *Project A*, *Project B*…
 
 ## Troubleshooting
 
@@ -275,7 +311,8 @@ If you move `usage.py` after running `--install`, run `--install` again from the
 - **A tool doesn't appear:** it only shows once its log folder has data from *this* machine. Web and app sessions (ChatGPT, claude.ai, Gemini web) aren't stored locally.
 - **Aider doesn't appear:** add the folder that holds your projects: `--set aider_dirs=~/work`.
 - **No commits showing:** the repo must be one your AI tools ran in, or listed in `git.extra_repos`. Check `git config user.email` in that repo matches the email on your commits, or turn off *Only my commits* in ⚙ Settings.
-- **Hermes shows no usage:** run `python3 usage.py --inspect-hermes` and open an issue with the output.
+- **Hermes shows no usage:** run `python3 usage.py --inspect-hermes` and open an issue with the output. Models Hermes is configured with but that have no price show as `—`; add a price with `--set prices.MODEL=[...]`.
+- **Menu bar meter says it can't find a plugin folder:** open SwiftBar once and pick a folder, or pass one: `--install-menubar ~/Documents/SwiftBar`. If it's installed but not visible, your menu bar may be full; macOS hides items that don't fit.
 - **No notifications:** run `--test-alert`. On macOS check *System Settings → Notifications* for Script Editor; on Linux install `notify-send`. Alerts are always printed in the Terminal output too.
 - **Which version am I running?** It's shown top-right on the page and at the start of the Terminal output, or run `--version`.
 
@@ -284,7 +321,7 @@ If you move `usage.py` after running `--install`, run `--install` again from the
 `SHA256SUMS` contains the SHA-256 hash of `usage.py` for this release:
 
 ```
-f44bc0da29bb403842d428eaa445c368e55ef818184a28c26fa9dbb1289d6ac0  usage.py
+879e99384606aad9283336d0f7ee03848daf6cc8a42367d0f457be168e996dc2  usage.py
 ```
 
 If the hash of your file doesn't match, don't run it. Download it again from this repo.

@@ -15,6 +15,9 @@ Works on macOS, Linux and Windows.
   python3 usage.py --cmc-key KEY        save a free CoinMarketCap key (used first for prices)
   python3 usage.py --coingecko-key KEY  save a free CoinGecko demo key
   python3 usage.py --test-alert         send a test desktop notification
+  python3 usage.py --export [FOLDER]    write every request and commit to CSV, plus a JSON summary
+  python3 usage.py --install-menubar    optional: add the menu bar meter to SwiftBar/xbar (macOS) or Argos (Linux)
+  python3 usage.py --menubar            print the menu bar output (used by that plugin)
   python3 usage.py --offline            skip status and price fetches
   python3 usage.py --inspect-hermes     print Hermes DB tables/columns (debugging)
   python3 usage.py --version
@@ -26,7 +29,7 @@ import argparse, copy, json, os, platform, re, shlex, shutil, sqlite3, statistic
 from datetime import datetime, timedelta
 from pathlib import Path
 
-VERSION = "2.8"  # bump on every change so the page and Terminal show which copy is running
+VERSION = "2.9.5"  # bump on every change so the page and Terminal show which copy is running
 
 HOME = Path.home()
 DATA_DIR = HOME / ".ai-usage"
@@ -59,6 +62,7 @@ DEFAULT_SETTINGS = {
     "currency": "USD",                      # crypto prices: USD, GBP, EUR, JPY, ...
     "coins": ["SOL", "BTC", "ETH", "XMR", "BNB", "XRP", "LINK"],   # symbols; use "SYM:coingecko-id" for unlisted coins
     "show_prices": True,
+    "screenshot_mode": False,               # replace project/repo names with "Project A", "Project B", ...
     "hidden_tools": [],                     # tools hidden on the dashboard by default, e.g. ["Hermes"]
     "refresh_minutes": 15,                  # background refresh (re-run --install after changing) and page reload
     "alerts": {
@@ -85,6 +89,7 @@ DEFAULT_SETTINGS = {
     "aider_dirs": ["~/code", "~/projects", "~/dev", "~/src", "~/repos", "~/Documents/GitHub", "~/tools"],
 }
 PROJECT_DIRS = set()   # folders the AI tools ran in; used to find git repos
+HERMES_TRACKED = [0]   # Hermes sessions/models seen on the last read (for the summary line)
 SOURCE_COLORS = {"Claude Code": "#ff6a13", "Codex": "#e6e6e6", "Hermes": "#8a8a8a",
                  "Gemini CLI": "#60a5fa", "OpenCode": "#2dd4bf", "Aider": "#f472b6"}
 SECRET_KEYS = ("cmc_key", "coingecko_key")
@@ -402,10 +407,11 @@ def collect_claude():
                 if not u:
                     continue
                 key = f"claude:{m.get('id')}:{e.get('requestId')}" if m.get("id") else f"claude:{f.name}:{i}"
+                used = [x.get("name") for x in (m.get("content") or []) if isinstance(x, dict) and x.get("type") == "tool_use" and x.get("name")]
                 rows.append((key, ts, "Claude Code", model,
                              n(u.get("input_tokens")), n(u.get("output_tokens")),
                              n(u.get("cache_creation_input_tokens")), n(u.get("cache_read_input_tokens")),
-                             project, session, None))
+                             project, session, None, ",".join(used) or None))
     return rows, events
 
 
@@ -451,30 +457,102 @@ def hermes_db():
     return None
 
 
+def _hermes_cost(actual, estimated):
+    """Hermes' own cost figure, if it has a real one. $0 usually means a subscription or free tier, which isn't the
+    API value, so return None and let the price table value it (free models with no list price show as '—')."""
+    for v in (actual, estimated):
+        if isinstance(v, (int, float)) and v > 0:
+            return float(v)
+    return None
+
+
 def collect_hermes():
-    """Best effort: any table with input/output token columns counts."""
+    """Hermes Agent keeps running totals per session (and per model). We record how much each total has grown since
+    the last refresh, timestamped at the session's last activity, so long-running chats land on the right day and
+    nothing is counted twice. Falls back to a best-effort reader for unknown database layouts."""
     path, rows = hermes_db(), []
     if not path:
         return rows
-    con = open_sqlite_ro(path)
+    src = open_sqlite_ro(path)
     try:
-        for (t,) in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall():
-            low = {r[1].lower(): r[1] for r in con.execute(f'PRAGMA table_info("{t}")')}
-            pick = lambda *names: next((low[c] for c in names if c in low), None)
-            inp, out = pick("input_tokens", "prompt_tokens"), pick("output_tokens", "completion_tokens")
-            if not (inp and out):
-                continue
-            cols = (pick("started_at", "created_at", "timestamp", "updated_at", "ended_at"), pick("model"), inp, out,
-                    pick("cache_write_tokens"), pick("cache_read_tokens", "cached_tokens"), pick("title", "name"))
-            sel = ", ".join(f'"{c}"' if c else "NULL" for c in cols)
-            for rowid, ts, model, i_, o_, w_, r_, title in con.execute(f'SELECT rowid, {sel} FROM "{t}"'):
-                ts = parse_ts(ts)
-                if ts is None:
-                    continue
-                rows.append((f"hermes:{t}:{rowid}", ts, "Hermes", model or "?", n(i_), n(o_), n(w_), n(r_),
-                             str(title) if title else "hermes", f"{t}:{rowid}", None))
+        tables = {t for (t,) in src.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        cols = lambda t: {r[1] for r in src.execute(f'PRAGMA table_info("{t}")')}
+        snaps = []  # (key, ts, model, input, output, cache_write, cache_read, cost, project, session)
+        if "sessions" in tables:
+            sc = cols("sessions")
+            pick = lambda *names: next((c for c in names if c in sc), None)
+            q = [pick("id"), pick("cwd"), pick("git_repo_root"), pick("title"), pick("last_activity_at", "ended_at", "started_at"), pick("model"),
+                 pick("input_tokens"), pick("output_tokens"), pick("cache_write_tokens"), pick("cache_read_tokens"),
+                 pick("actual_cost_usd"), pick("estimated_cost_usd")]
+            sessions = {}
+            for r in src.execute("SELECT " + ", ".join(f'"{c}"' if c else "NULL" for c in q) + " FROM sessions"):
+                sid, cwd, root, title, last, model, i_, o_, w_, cr_, act, est = r
+                where = root or cwd
+                if where:
+                    PROJECT_DIRS.add(where)
+                sessions[sid] = {"project": project_name(where, None) if where else (str(title)[:40] if title else "hermes"),
+                                 "last": parse_ts(last), "row": (model, i_, o_, w_, cr_, act, est)}
+        else:
+            sessions = {}
+        if "session_model_usage" in tables and src.execute("SELECT 1 FROM session_model_usage LIMIT 1").fetchone():
+            for sid, model, i_, o_, cr_, cw_, act, est, first, last in src.execute(
+                    "SELECT session_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
+                    "actual_cost_usd, estimated_cost_usd, first_seen, last_seen FROM session_model_usage"):
+                s = sessions.get(sid, {})
+                ts = parse_ts(last) or s.get("last") or parse_ts(first)
+                snaps.append((f"{sid}|{model}", ts, model or "?", n(i_), n(o_), n(cw_), n(cr_), _hermes_cost(act, est),
+                              s.get("project", "hermes"), str(sid)))
+        elif sessions:
+            for sid, s in sessions.items():
+                model, i_, o_, w_, cr_, act, est = s["row"]
+                snaps.append((f"{sid}|{model}", s["last"], model or "?", n(i_), n(o_), n(w_), n(cr_), _hermes_cost(act, est),
+                              s["project"], str(sid)))
+        else:  # unknown layout: best effort, one table only
+            for t in sorted(tables):
+                c = cols(t)
+                if {"input_tokens", "output_tokens"} <= c or {"prompt_tokens", "completion_tokens"} <= c:
+                    i_c = "input_tokens" if "input_tokens" in c else "prompt_tokens"
+                    o_c = "output_tokens" if "output_tokens" in c else "completion_tokens"
+                    t_c = next((x for x in ("last_seen", "last_activity_at", "ended_at", "updated_at", "timestamp", "created_at", "started_at") if x in c), None)
+                    m_c = "model" if "model" in c else None
+                    for rowid, ts, model, i_, o_ in src.execute(
+                            f'SELECT rowid, {t_c or "NULL"}, {m_c or "NULL"}, "{i_c}", "{o_c}" FROM "{t}"'):
+                        snaps.append((f"{t}:{rowid}", parse_ts(ts), model or "?", n(i_), n(o_), 0, 0, None, "hermes", f"{t}:{rowid}"))
+                    break
     finally:
-        con.close()
+        src.close()
+
+    HERMES_TRACKED[0] = len(snaps)
+    # turn running totals into growth since the last refresh
+    DATA_DIR.mkdir(exist_ok=True)
+    con = sqlite3.connect(DB_PATH)
+    con.execute("CREATE TABLE IF NOT EXISTS hermes_seen(key TEXT PRIMARY KEY, input INT, output INT, cache_write INT, cache_read INT, cost REAL)")
+    con.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
+    if not con.execute("SELECT 1 FROM meta WHERE key='hermes_v3'").fetchone():
+        # rebuild Hermes history once: v2.9.1 and earlier double-counted and dated at session start,
+        # v2.9.2-2.9.4 took Hermes' $0 subscription costs literally
+        try:
+            con.execute("DELETE FROM usage WHERE source='Hermes'")
+        except sqlite3.Error:
+            pass
+        con.execute("DELETE FROM hermes_seen")
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('hermes_v3', '1')")
+    seen = {k: v for k, *v in con.execute("SELECT key, input, output, cache_write, cache_read, cost FROM hermes_seen")}
+    now = time.time()
+    for key, ts, model, i_, o_, cw_, cr_, cost, project, sid in snaps:
+        prev = seen.get(key, [0, 0, 0, 0, 0.0])
+        cur = [i_, o_, cw_, cr_, cost or 0.0]
+        if any(c < p for c, p in zip(cur[:4], prev[:4])):   # totals went down (session reset): start over
+            prev = [0, 0, 0, 0, 0.0]
+        d = [c - p for c, p in zip(cur, prev)]
+        if not any(d[:4]):
+            continue
+        dcost = round(d[4], 8) if cost is not None else None
+        rows.append((f"hermes2:{key}:{i_}:{o_}:{cr_}", min(ts or now, now), "Hermes", model, d[0], d[1], d[2], d[3],
+                     project, sid, dcost))
+        con.execute("INSERT OR REPLACE INTO hermes_seen VALUES (?,?,?,?,?,?)", (key, *cur))
+    con.commit()
+    con.close()
     return rows
 
 
@@ -850,6 +928,8 @@ def store(rows, events, meta):
         con.execute("ALTER TABLE usage ADD COLUMN session TEXT")
     if "cost" not in cols:
         con.execute("ALTER TABLE usage ADD COLUMN cost REAL")
+    if "tools" not in cols:
+        con.execute("ALTER TABLE usage ADD COLUMN tools TEXT")
     con.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
     con.execute("CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY, ts REAL, kind TEXT, detail TEXT)")
     con.execute("CREATE TABLE IF NOT EXISTS prices(ts REAL, coin TEXT, price REAL, PRIMARY KEY(ts, coin))")
@@ -860,8 +940,8 @@ def store(rows, events, meta):
         con.executemany("INSERT OR IGNORE INTO prices VALUES (?,?,?)",
                         [(p["fetched"], f'{c["id"]}:{p.get("currency", "GBP")}', c["current_price"]) for c in p["coins"] if c.get("current_price") is not None])
         con.execute("DELETE FROM prices WHERE ts < ?", (time.time() - 8 * 86400,))
-    con.executemany("INSERT OR REPLACE INTO usage(id,ts,source,model,input,output,cache_write,cache_read,project,session,cost) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)", [r for r in rows if r[1] is not None])
+    con.executemany("INSERT OR REPLACE INTO usage(id,ts,source,model,input,output,cache_write,cache_read,project,session,cost,tools) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", [tuple(r) + (None,) * (12 - len(r)) for r in rows if r[1] is not None])
     con.executemany("INSERT OR REPLACE INTO events VALUES (?,?,?,?)", events)
     for k, v in meta.items():
         if v is not None:
@@ -892,12 +972,32 @@ def hit_rate(i, cw, cr):
     return round(cr / tot * 100, 1) if tot else None
 
 
+# Model advice: big models doing small jobs. (pattern, cheaper model to price against, labels)
+ADVICE = [
+    (r"(fable|mythos)-5", "claude-opus-5-5", "Fable/Mythos", "Opus 5.5"),
+    (r"opus", "claude-sonnet-5-5", "Opus", "Sonnet 5.5"),
+    (r"gpt-5-6-sol|gpt-5-5(?!-pro)", "gpt-5.4-mini", "GPT-5.5-class", "GPT-5.4 mini"),
+]
+SMALL_OUTPUT = 800   # a request that writes fewer tokens than this counts as "small"
+
+
+def forecast_window(used_pct, window_s, remaining_s):
+    """Linear pace for a rate-limit window: where it lands at reset, and when it would hit 100%."""
+    elapsed = window_s - remaining_s
+    if used_pct is None or elapsed < 600 or used_pct <= 0 or remaining_s is None or remaining_s <= 0:
+        return None
+    rate = used_pct / elapsed
+    projected = used_pct + rate * remaining_s
+    hit = time.time() + (100 - used_pct) / rate if projected > 100 and used_pct < 100 else None
+    return {"used": used_pct, "projected": round(projected, 1), "hit_ts": hit, "reset_ts": time.time() + remaining_s}
+
+
 def aggregate(con, cfg):
     now = time.time()
     since30 = now - 30 * 86400
     pricer = Pricer(cfg.get("prices"))
     data = con.execute(
-        "SELECT ts, source, model, input, output, cache_write, cache_read, project, session, cost "
+        "SELECT ts, source, model, input, output, cache_write, cache_read, project, session, cost, tools "
         "FROM usage WHERE ts >= ? ORDER BY ts", (since30,)).fetchall()
     sources = SOURCES
 
@@ -905,7 +1005,7 @@ def aggregate(con, cfg):
     day_starts = [today - timedelta(days=d) for d in range(29, -1, -1)]
     days = [d.strftime("%Y-%m-%d") for d in day_starts]
     top = datetime.now().replace(minute=0, second=0, microsecond=0)
-    hour_starts = [top - timedelta(hours=h) for h in range(47, -1, -1)]
+    hour_starts = [top - timedelta(hours=h) for h in range(71, -1, -1)]   # 72h, so the page can show 24/48/72
     hours = [h.strftime("%Y-%m-%d %H") for h in hour_starts]
 
     daily = {s: {d: 0 for d in days} for s in sources}
@@ -922,8 +1022,11 @@ def aggregate(con, cfg):
     ev = {s: [] for s in sources}
     cache_now, cache_prev = [0, 0, 0], [0, 0, 0]
     cache_daily = {d: [0, 0, 0] for d in days}
+    advice_rules = [(re.compile(p), cheap, a, b) for p, cheap, a, b in ADVICE]
+    advice = {}
+    last_hour = {s: 0 for s in sources}
 
-    for ts, src, model, i, o, cw, cr, proj, sess, explicit in data:
+    for ts, src, model, i, o, cw, cr, proj, sess, explicit, tools in data:
         if src not in win5:
             continue
         w = i + o + cw  # "work" tokens; cache reads tracked separately
@@ -957,12 +1060,33 @@ def aggregate(con, cfg):
                 for k, v in enumerate((i, cw, cr)):
                     cache_daily[d][k] += v
         s = sessions.setdefault((src, sess or "?"), {"source": src, "project": proj, "start": ts, "end": ts,
-                                                      "tokens": 0, "cost": 0.0, "calls": 0, "models": {}})
+                                                      "tokens": 0, "cost": 0.0, "calls": 0, "models": {},
+                                                      "cache": [0, 0, 0], "tools": {}, "timeline": []})
         s["end"] = max(s["end"], ts)
         s["tokens"] += w
         s["cost"] += c
         s["calls"] += 1
         s["models"][model] = s["models"].get(model, 0) + w
+        for k, v in enumerate((i, cw, cr)):
+            s["cache"][k] += v
+        s["timeline"].append([round(ts), i, o, cw, cr, round(c, 5)])
+        for t in (tools or "").split(","):
+            if t:
+                s["tools"][t] = s["tools"].get(t, 0) + 1
+        if explicit is None and c:
+            key = norm_model(model)
+            for rx, cheap, big_label, cheap_label in advice_rules:
+                if rx.search(key):
+                    a = advice.setdefault((src, big_label), {"source": src, "from": big_label, "to": cheap_label,
+                                                            "calls": 0, "small": 0, "cost_small": 0.0, "cost_alt": 0.0})
+                    a["calls"] += 1
+                    if o < SMALL_OUTPUT:
+                        a["small"] += 1
+                        a["cost_small"] += c
+                        a["cost_alt"] += pricer.cost(cheap, i, o, cw, cr) or c
+                    break
+        if ts >= now - 3600:
+            last_hour[src] += w
         ev[src].append((ts, w))
         cost30[src] += c
         if ts >= now - WINDOW_5H:
@@ -990,7 +1114,15 @@ def aggregate(con, cfg):
 
     sess_list = sorted(sessions.values(), key=lambda s: -s["end"])[:20]
     for s in sess_list:
-        s["model"] = max(s.pop("models").items(), key=lambda kv: kv[1])[0]
+        mods = s.pop("models")
+        s["model"] = max(mods.items(), key=lambda kv: kv[1])[0]
+        s["models"] = sorted(mods, key=lambda m: -mods[m])
+        s["cache_hit"] = hit_rate(*s.pop("cache"))
+        tl = s["timeline"]
+        if len(tl) > 400:  # keep the page light: merge neighbouring requests
+            step = -(-len(tl) // 400)
+            tl = [[g[0][0], *[sum(x[k] for x in g) for k in range(1, 6)]] for g in (tl[j:j + step] for j in range(0, len(tl), step))]
+        s["timeline"] = tl
 
     meta = {k: json.loads(v) for k, v in con.execute("SELECT key, value FROM meta")}
     p = meta.get("prices")
@@ -1011,6 +1143,31 @@ def aggregate(con, cfg):
     gcfg = cfg.get("git") or {}
     git = {"enabled": bool(gcfg.get("enabled", True)), "commits": commits,
            "repos": list(repos_i), "tools": list(tools_i), "mine_default": gcfg.get("author", "me") != "all"}
+    # pace forecasts
+    limit_est = int(statistics.median(claude_hits)) if claude_hits else None
+    fc = {"claude5h": None, "codex": {}, "week": {}, "today": {}}
+    if limit_est and last_hour["Claude Code"] > 0 and win5["Claude Code"] < limit_est:
+        fc["claude5h"] = {"eta_ts": now + (limit_est - win5["Claude Code"]) / last_hour["Claude Code"] * 3600,
+                          "rate_hr": last_hour["Claude Code"]}
+    cl = meta.get("codex_limits")
+    if cl and now - cl.get("ts", 0) < 6 * 3600:
+        for k, default_min in (("primary", 300), ("secondary", 10080)):
+            wdw = (cl.get("limits") or {}).get(k) or {}
+            rem = wdw.get("resets_in_seconds")
+            rem = rem - (now - cl["ts"]) if rem is not None else (wdw["resets_at"] - now if wdw.get("resets_at") else None)
+            f = forecast_window(wdw.get("used_percent"), (wdw.get("window_minutes") or default_min) * 60, rem)
+            if f:
+                fc["codex"][k] = f
+    for src in sources:
+        vals = [daily[src][d] for d in days]
+        prev = vals[-28:-7]
+        avg_prev = sum(prev) / 3 if any(prev) else None
+        fc["week"][src] = {"now": sum(vals[-7:]), "avg_prev": avg_prev}
+    frac = (now - today.timestamp()) / 86400
+    if frac > 0.1:
+        fc["today"] = {"frac": frac,
+                       "tokens": {s: daily[s][days[-1]] / frac for s in sources},
+                       "cost": {s: daily_cost[s][days[-1]] / frac for s in sources}}
     theme = cfg.get("theme") or {}
     colors = {**SOURCE_COLORS, "Claude Code": theme.get("accent") or SOURCE_COLORS["Claude Code"], **(theme.get("colors") or {})}
     plans = {k: float(v) for k, v in (cfg.get("plans") or {}).items() if isinstance(v, (int, float)) and v > 0}
@@ -1027,7 +1184,11 @@ def aggregate(con, cfg):
         "cost30": cost30, "cost7": cost7, "plans": plans,
         "unpriced": sorted(unpriced.items(), key=lambda kv: -kv[1])[:5],
         "peak5": {s: peak_window(ev[s], WINDOW_5H) for s in sources},
-        "limit_est": int(statistics.median(claude_hits)) if claude_hits else None,
+        "limit_est": limit_est,
+        "forecast": fc,
+        "advice": [a for a in advice.values() if a["small"]],
+        "privacy": bool(cfg.get("screenshot_mode", False)),
+        "alert_pct": (cfg.get("alerts") or {}).get("claude_5h_percent", 85),
         "limit_hits": len(claude_hits),
         "limits": limits,
         "cache": {"now": hit_rate(*cache_now), "prev": hit_rate(*cache_prev),
@@ -1051,6 +1212,153 @@ def aggregate(con, cfg):
         "sessions": sess_list,
         "row_count": len(data),
     }
+
+
+# ---------- export ----------
+def export_data(con, cfg, out_dir):
+    """Every request and commit as CSV (plus a JSON summary), costs priced with your current settings."""
+    import csv
+    out = Path(os.path.expanduser(out_dir))
+    out.mkdir(parents=True, exist_ok=True)
+    pricer = Pricer(cfg.get("prices"))
+    stamp = datetime.now().strftime("%Y-%m-%d")
+    alias = {}
+    anon = (lambda p: alias.setdefault(p, f"Project {len(alias) + 1}")) if cfg.get("screenshot_mode") else (lambda p: p)
+    paths = []
+    p = out / f"build-commit-pro-requests-{stamp}.csv"
+    with open(p, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["time", "tool", "model", "input_tokens", "output_tokens", "cache_write_tokens", "cache_read_tokens",
+                    "api_cost_usd", "project", "session", "claude_code_tools"])
+        for ts, src, model, i, o, cw, cr, proj, sess, explicit, tools in con.execute(
+                "SELECT ts, source, model, input, output, cache_write, cache_read, project, session, cost, tools FROM usage ORDER BY ts"):
+            cost = pricer.cost(model, i or 0, o or 0, cw or 0, cr or 0, explicit)
+            w.writerow([datetime.fromtimestamp(ts).isoformat(timespec="seconds"), src, model, i, o, cw, cr,
+                        "" if cost is None else round(cost, 6), anon(proj), sess, tools or ""])
+    paths.append(p)
+    p = out / f"build-commit-pro-commits-{stamp}.csv"
+    with open(p, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["time", "repo", "lines_added", "lines_deleted", "files_changed", "ai_tool", "mine"])
+        for ts, repo, a, d, f, ai, mine in con.execute("SELECT ts, repo, added, deleted, files, ai, mine FROM commits ORDER BY ts"):
+            w.writerow([datetime.fromtimestamp(ts).isoformat(timespec="seconds"), anon(repo), a, d, f, ai or "", mine])
+    paths.append(p)
+    agg = aggregate(con, cfg)
+    summary = {k: agg[k] for k in ("version", "generated", "sources", "win5", "week", "cost30", "cost7", "plans",
+                                   "limit_est", "forecast", "advice", "cache", "codex_limits")}
+    summary["models_30d"] = [dict(zip(["tool", "model", "input", "output", "cache_write", "cache_read", "api_cost_usd"], m)) for m in agg["models"]]
+    summary["projects_30d"] = [{"project": anon(k), "tokens": t, "api_cost_usd": round(c, 4), "tools": srcs} for k, t, c, srcs in agg["projects"]]
+    p = out / f"build-commit-pro-summary-{stamp}.json"
+    p.write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
+    paths.append(p)
+    return paths
+
+
+# ---------- menu bar (SwiftBar / xbar on macOS, Argos on Linux) ----------
+def menubar(cfg):
+    if not DB_PATH.exists():
+        print("BCP –\n---\nNo data yet: run usage.py once | color=gray")
+        return
+    con = sqlite3.connect(DB_PATH)
+    try:
+        a = aggregate(con, cfg)
+    finally:
+        con.close()
+    now = time.time()
+    dash = OUT_HTML.as_uri()
+    fmt = lambda v: f"{v / 1e6:.1f}M" if v >= 1e6 else f"{v / 1e3:.0f}k" if v >= 1e3 else str(int(v))
+    hhmm = lambda t: datetime.fromtimestamp(t).strftime("%a %H:%M" if t - now > 20 * 3600 else "%H:%M")
+    title, lines, worst = [], [], 0
+
+    def add(text, **params):
+        # every line opens the dashboard: clickable items show in normal (not greyed-out) text
+        params.setdefault("href", dash)
+        lines.append(text + " | " + " ".join(f"{k}={v}" for k, v in params.items()))
+
+    c5 = a["win5"]["Claude Code"]
+    wk = a["forecast"]["week"]["Claude Code"]
+    if a["limit_est"]:
+        pct = c5 / a["limit_est"] * 100
+        worst = max(worst, pct)
+        title.append(f"CC {pct:.0f}%")
+        add(f"Claude 5h: {fmt(c5)} tokens ({pct:.0f}% of est. limit {fmt(a['limit_est'])})")
+    else:
+        title.append(f"CC {fmt(c5)}" if c5 else f"CC 7d {fmt(wk['now'])}")
+        add(f"Claude 5h: {fmt(c5)} tokens (Claude Code only)")
+        add("   forecast starts after your first Claude Code limit hit", color="gray")
+        add("   Claude app use shares your limit: see Claude → Settings → Usage", color="gray", href="https://claude.ai/settings/usage")
+    if a["forecast"]["claude5h"]:
+        add(f"   at this pace: limit around {hhmm(a['forecast']['claude5h']['eta_ts'])}", color="#ff9f0a")
+    add(f"Claude 7d: {fmt(wk['now'])}" + (f" ({(wk['now'] / wk['avg_prev'] - 1) * 100:+.0f}% vs 3-wk avg)" if wk["avg_prev"] else ""))
+    cl = (a.get("codex_limits") or {}).get("limits") or {}
+    if cl.get("primary"):
+        p5 = cl["primary"].get("used_percent") or 0
+        pw = (cl.get("secondary") or {}).get("used_percent")
+        worst = max(worst, p5, pw or 0)
+        title.append(f"CX {p5:.0f}%")
+        add(f"Codex: 5h {p5:.0f}%" + (f" · week {pw:.0f}%" if pw is not None else ""))
+        for k, label in (("primary", "5h"), ("secondary", "weekly")):
+            f = a["forecast"]["codex"].get(k)
+            if f and f["hit_ts"]:
+                add(f"   {label} limit at this pace: {hhmm(f['hit_ts'])}", color="#ff453a")
+            elif f:
+                add(f"   {label} on pace for {f['projected']:.0f}% by reset")
+    add(f"API value 30d: ${sum(a['cost30'].values()):,.2f}")
+    commits = [c for c in a["git"]["commits"] if c[5]] if a["git"]["enabled"] else []
+    if commits:
+        ai = sum(1 for c in commits if c[4] >= 0)
+        add(f"Commits 30d: {len(commits)} ({ai * 100 // len(commits)}% with AI)")
+    st = a.get("status")
+    if st and st.get("indicator") not in (None, "none"):
+        title.append("⚠")
+        add(f"Claude: {st.get('description')}", color="#ff453a", href="https://status.claude.com")
+    color = " | color=#ff453a" if worst >= 85 else ""
+    print(" · ".join(title) + color)
+    print("---")
+    print("\n".join(lines))
+    print("---")
+    print(f"Open dashboard | href={dash}")
+    py, script = _runner()
+    dq = lambda v: f'"{v}"' if " " in v else v   # SwiftBar/xbar want double quotes around paths with spaces
+    print(f"Refresh now | bash={dq(py)} param1={dq(script)} param2=--no-open terminal=false refresh=true")
+    print(f"Updated {datetime.fromtimestamp(DB_PATH.stat().st_mtime):%H:%M} | color=gray size=11")
+
+
+def install_menubar(target=None):
+    system = platform.system()
+    candidates = []
+    if target:
+        candidates = [Path(os.path.expanduser(target))]
+    elif system == "Darwin":
+        try:
+            d = subprocess.run(["defaults", "read", "com.ameba.SwiftBar", "PluginDirectory"], capture_output=True, text=True).stdout.strip()
+            if d:
+                candidates.append(Path(os.path.expanduser(d)))
+        except OSError:
+            pass
+        candidates.append(HOME / "Library" / "Application Support" / "xbar" / "plugins")
+    elif system == "Linux":
+        candidates.append(HOME / ".config" / "argos")
+    else:
+        print("The menu bar meter is optional and only available on macOS (SwiftBar/xbar) and Linux GNOME (Argos).")
+        print("Everything else works on Windows as normal.")
+        return
+    dest = next((c for c in candidates if c.is_dir()), None)
+    if not dest:
+        print("The menu bar meter is optional, and needs a menu bar app with a plugin folder, which wasn't found.")
+        print("To add it: install SwiftBar (brew install --cask swiftbar, or swiftbar.app), open it once and pick a plugin folder,")
+        print("then run this again, or pass the folder: usage.py --install-menubar ~/path/to/plugins")
+        print("Everything else (dashboard, alerts, background refresh) works without it.")
+        return
+    py, script = _runner()
+    plugin = dest / "build-commit-pro.2m.sh"
+    plugin.write_text("#!/bin/bash\n"
+                      "# <swiftbar.hideAbout>true</swiftbar.hideAbout><swiftbar.hideRunInTerminal>true</swiftbar.hideRunInTerminal>\n"
+                      "# <xbar.title>Build & Commit Pro Tracker</xbar.title>\n"
+                      f"exec {shlex.quote(py)} {shlex.quote(script)} --menubar\n", encoding="utf-8")
+    plugin.chmod(0o755)
+    print(f"Menu bar meter installed: {plugin}")
+    print("It re-reads your data every 2 minutes; keep --install on so the data itself stays fresh.")
 
 
 # ---------- alerts ----------
@@ -1221,7 +1529,8 @@ h1 .amp{color:var(--accent)}
 .card{text-shadow:0 1px 2px rgba(0,0,0,.9);background:var(--panel-a);-webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur);border:1px solid var(--edge);border-radius:8px;padding:12px 14px;min-width:0;transition:border-color .2s}
 .card:hover{border-color:var(--edge-hi)}
 .ch{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap}
-.ctrls{display:flex;gap:6px}
+.ctrls{display:flex;gap:6px;flex-wrap:wrap}
+@media(max-width:520px){.seg button{padding:5px 9px}.ctrls{width:100%}}
 h2{font-family:var(--pixel);font-weight:500;font-size:17px;margin:0}
 h3{font-family:var(--mono);font-size:10.5px;font-weight:400;color:var(--mute);text-transform:uppercase;letter-spacing:.08em;margin:12px 0 4px}
 .hint{font-family:var(--mono);font-size:10.5px;color:var(--mute)}
@@ -1282,6 +1591,30 @@ td.trunc{max-width:170px;overflow:hidden;text-overflow:ellipsis}
 
 /* heatmap */
 .heatcard{display:flex;flex-direction:column}
+/* session drill-down */
+#sessions tr.click{cursor:pointer}
+#sessions tr.click:hover td,#sessions tr.click:focus td{background:rgba(255,255,255,.04)}
+#sessions tr.click:focus{outline:none}
+.modal{position:fixed;inset:0;z-index:40;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.55);padding:16px}
+.modal[hidden]{display:none}
+.mbox{width:min(760px,100%);max-height:calc(100vh - 32px);overflow:auto;scrollbar-width:none;background:rgba(14,14,14,.97);border:1px solid var(--edge-hi);
+  border-radius:10px;padding:16px 18px 18px;box-shadow:0 18px 60px rgba(0,0,0,.7)}
+.mbox::-webkit-scrollbar{display:none}
+.mstats{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;margin:12px 0 4px}
+.mstats div{background:var(--panel2);border-radius:6px;padding:8px 10px}
+.mstats b{display:block;font:700 17px var(--mono);margin-top:2px}
+.tl{width:100%;height:120px;display:block;margin-top:6px}
+.tl rect:hover{opacity:.7}
+.toolbars{display:grid;grid-template-columns:auto 1fr auto;gap:5px 10px;align-items:center;font:12px var(--mono);margin-top:6px}
+.toolbars i{display:block;height:8px;border-radius:2px;background:var(--accent)}
+.toolbars em{font-style:normal;color:var(--mute);text-align:right}
+/* model advice */
+.tip:not([hidden])+.scroll{max-height:98px!important}
+.tip{font-size:11px;line-height:1.35;cursor:help;color:var(--mute);background:rgba(74,222,128,.07);border:1px solid rgba(74,222,128,.22);border-radius:6px;padding:6px 8px;margin:-2px 0 8px}
+.tip b{color:var(--ink)}
+.tip[hidden]{display:none}
+.fc{color:var(--amber)}.fc.bad{color:var(--down)}
+.hintline{color:var(--dim);cursor:help;border-bottom:1px dotted var(--dim)}
 .heat{flex:1;min-height:132px;display:grid;grid-template-columns:28px repeat(24,minmax(0,1fr));grid-template-rows:auto repeat(7,minmax(10px,1fr));
   gap:2px;font-family:var(--mono);font-size:9.5px;color:var(--mute)}
 .heat i{border-radius:2px;background:var(--panel2);display:block}
@@ -1305,8 +1638,12 @@ td.trunc{max-width:170px;overflow:hidden;text-overflow:ellipsis}
   <h3>Coins in the ticker</h3><div class="coinpick" id="s-coins"></div>
   <div class="dfoot"><p>Saved in this browser. To make these the defaults everywhere, run:</p>
     <code class="cmd" id="s-cmd"></code>
-    <div class="dbtns"><button class="btn" id="s-copy">Copy command</button><button class="btn" id="s-reset">Reset</button></div></div>
+    <div class="dbtns"><button class="btn" id="s-copy">Copy command</button><button class="btn" id="s-reset">Reset</button></div>
+    <h3 style="margin-top:14px">Export</h3>
+    <div class="dbtns"><button class="btn" id="x-csv">Daily CSV</button><button class="btn" id="x-json">Full JSON</button></div>
+    <p style="margin-top:6px">Every single request: <code>usage.py --export</code></p></div>
 </div>
+<div class="modal" id="modal" hidden><div class="mbox" role="dialog" aria-modal="true" aria-labelledby="mtitle" id="mbox"></div></div>
 <main>
 <header class="top"><h1>Build <span class="amp">&amp;</span> Commit Pro Tracker</h1><div class="sub" id="sub"></div></header>
 
@@ -1316,7 +1653,7 @@ td.trunc{max-width:170px;overflow:hidden;text-overflow:ellipsis}
   <div class="card chartcard">
     <div class="ch" style="margin-bottom:4px"><h2 id="charttitle">Hourly · last 48h</h2>
       <div class="ctrls"><div class="seg" id="metricseg"><button data-m="tokens" class="on">Tokens</button><button data-m="cost">Cost</button><button data-m="commits" id="m-commits">Commits</button></div>
-      <div class="seg" id="viewseg"><button data-v="hourly" class="on">Hourly</button><button data-v="daily">Daily</button></div></div></div>
+      <div class="seg" id="viewseg" role="tablist" aria-label="Time range"><button data-v="h24" role="tab">24h</button><button data-v="h48" role="tab" class="on">48h</button><button data-v="h72" role="tab">72h</button><button data-v="d7" role="tab">7d</button><button data-v="d14" role="tab">14d</button><button data-v="daily" role="tab">30d</button></div></div></div>
     <div class="legend" id="legend"></div>
     <div class="chartbox"><canvas id="chart"></canvas></div>
   </div>
@@ -1326,7 +1663,7 @@ td.trunc{max-width:170px;overflow:hidden;text-overflow:ellipsis}
 <section class="row r3">
   <div class="card heatcard"><div class="ch"><h2>When you work</h2><span class="hint">tokens by hour · 30d</span></div><div class="heat" id="heat"></div><div class="heatsum" id="heatsum"></div></div>
   <div class="card"><div class="ch"><h2>Recent sessions</h2><span class="hint">latest 20</span></div><div class="scroll tall"><table id="sessions"></table></div></div>
-  <div class="card"><div class="ch"><h2>Models</h2><span class="hint">30d</span></div><div class="scroll" style="max-height:140px"><table id="models"></table></div>
+  <div class="card"><div class="ch"><h2>Models</h2><span class="hint">30d</span></div><div class="tip" id="tip" hidden></div><div class="scroll" style="max-height:120px"><table id="models"></table></div>
     <h3>Projects</h3><div class="scroll" style="max-height:84px"><table id="projects"></table></div></div>
 </section>
 
@@ -1347,13 +1684,18 @@ const when = t => {const d=new Date(t*1000); return `${pad(d.getDate())}/${pad(d
 const dur = s => { if(s==null||s<0) return "—"; const h=Math.floor(s/3600), m=Math.round(s%3600/60); return h? `${h}h ${m}m` : `${m}m`; };
 document.getElementById("ver").textContent = "v" + (D.version || "?");
 const $ = q => document.querySelector(q);
+const DAYS=["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
 
 /* ---- viewer preferences: saved in this browser, defaults come from the settings file ---- */
 const PKEY = "ai-usage-prefs";
-const DEF = {hidden:D.hidden||[], prices:true, animate:D.animate, coins:D.coins, gitMine:D.git.mine_default};
+const DEF = {hidden:D.hidden||[], prices:true, animate:D.animate, coins:D.coins, gitMine:D.git.mine_default, privacy:D.privacy, view:"h48"};
 let P = (()=>{ try{ const s=JSON.parse(localStorage.getItem(PKEY)||"null"); if(s&&typeof s==="object") return {...DEF, ...s}; }catch(e){} return {...DEF}; })();
 function savePrefs(){ try{ localStorage.setItem(PKEY, JSON.stringify(P)); }catch(e){} }
 const on = s => !P.hidden.includes(s);
+// screenshot mode: stable stand-in names, assigned in order of appearance
+const ALIAS = {};
+[...D.projects.map(p=>p[0]), ...D.sessions.map(s=>s.project), ...D.git.repos].forEach(n=>{ if(!(n in ALIAS)) ALIAS[n]="Project "+String.fromCharCode(65+Object.keys(ALIAS).length%26)+(Object.keys(ALIAS).length>=26?Math.floor(Object.keys(ALIAS).length/26):""); });
+const pname = n => P.privacy ? (ALIAS[n]||"Project") : n;
 const VIS = () => D.sources.filter(on);
 const hasGit = () => D.git.enabled && D.git.commits.length>0;
 const gitOn = () => hasGit() && on("Git");
@@ -1400,7 +1742,8 @@ const STATUS_COL = {none:"var(--up)",operational:"var(--up)",minor:"var(--amber)
 function renderSub(){
   const st=D.status;
   const s = st ? `<span class="pill"><i class="dot" style="background:${STATUS_COL[st.indicator]||"var(--mute)"};border-radius:50%"></i>Claude: ${esc(st.description.toLowerCase())}</span>` : "";
-  document.getElementById("sub").innerHTML = `<span>updated ${D.generated}</span><span>${D.row_count.toLocaleString()} entries / 30d</span>${s}`;
+  document.getElementById("sub").innerHTML = `<span>updated ${D.generated}</span><span>${D.row_count.toLocaleString()} entries / 30d</span>${s}`+
+    (P.privacy?`<span class="pill" title="Project names are hidden (⚙ Settings)">🙈 names hidden</span>`:"");
 }
 renderSub();
 
@@ -1426,19 +1769,34 @@ function resetText(w){
 }
 const L = D.codex_limits && D.codex_limits.limits;
 const hasCodex = !!L || D.sources.includes("Codex");
+function codexPace(){
+  const cf=(D.forecast||{}).codex||{}, out=[];
+  for(const [k,label] of [["primary","5h"],["secondary","week"]]){
+    const f=cf[k]; if(!f) continue;
+    if(f.hit_ts){ const d=new Date(f.hit_ts*1000); out.push(`<span class="fc bad">${label} limit ~${DAYS[(d.getDay()+6)%7]} ${pad(d.getHours())}:${pad(d.getMinutes())}</span>`); }
+    else if(k==="secondary") out.push(`<span title="projected use when the weekly window resets">week on pace for ${Math.round(f.projected)}%</span>`);
+  }
+  return out.length ? "<br>"+out.join(" · ") : "";
+}
 function renderCards(){
   let h = "";
   const cn = D.win5["Claude Code"], vs = VIS();
   if(on("Claude Code")){
+  const F=D.forecast||{}, at=t=>{const d=new Date(t*1000), soon=t-Date.now()/1000<20*3600; return soon?`${pad(d.getHours())}:${pad(d.getMinutes())}`:`${DAYS[(d.getDay()+6)%7]} ${pad(d.getHours())}:${pad(d.getMinutes())}`;};
   if(D.limit_est){
-    h += card("Claude Code","Claude · 5h",fmt(cn), `${Math.round(cn/D.limit_est*100)}% of est. limit (${fmt(D.limit_est)})`, cn/D.limit_est*100);
+    const eta=F.claude5h&&F.claude5h.eta_ts>Date.now()/1000 ? `<br><span class="fc bad">limit ~${at(F.claude5h.eta_ts)} at this pace</span>` : "";
+    h += card("Claude Code","Claude · 5h",fmt(cn), `${Math.round(cn/D.limit_est*100)}% of est. limit (${fmt(D.limit_est)})${eta}`, cn/D.limit_est*100);
   } else {
     const cp = D.peak5["Claude Code"];
-    h += card("Claude Code","Claude · 5h",fmt(cn), cp ? `${Math.round(cn/cp*100)}% of busiest 5h (${fmt(cp)})` : "no history yet", cp? cn/cp*100 : null);
+    const why=`Counts Claude Code on this computer only. Your Claude limit is shared with the Claude app and claude.ai, which aren't stored locally; see Settings → Usage in Claude for the full figure. The forecast and the ${D.alert_pct||85}% alert start once Claude Code has hit a limit, so the tracker knows where your limit sits.`;
+    h += card("Claude Code","Claude · 5h",fmt(cn), (cp ? `${Math.round(cn/cp*100)}% of busiest 5h (${fmt(cp)})` : "no history yet")+
+      `<br><span class="hintline" title="${esc(why)}">forecast after first limit hit ⓘ</span>`, cp? cn/cp*100 : null);
   }
   const hits=D.limits.filter(l=>l.source==="Claude Code").length;
   const d7=D.days.slice(-7).map(d=>D.daily["Claude Code"][d]);
-  h += card("Claude Code","Claude · 7d",fmt(D.week["Claude Code"]),`${hits} limit hit${hits===1?"":"s"} in 30d`,null,sparkSvg(d7,css("var(--claude)")));
+  const wk=(F.week||{})["Claude Code"], vsAvg=wk&&wk.avg_prev ? (wk.now/wk.avg_prev-1)*100 : null;
+  h += card("Claude Code","Claude · 7d",fmt(D.week["Claude Code"]),
+    (vsAvg==null?"":`<span class="${vsAvg>25?"fc":""}">${vsAvg>=0?"+":""}${vsAvg.toFixed(0)}% vs 3-wk avg</span> · `)+`${hits} limit hit${hits===1?"":"s"}`,null,sparkSvg(d7,css("var(--claude)")));
   }
   const tot=vs.reduce((a,s)=>a+D.cost30[s],0), plan=vs.reduce((a,s)=>a+(D.plans[s]||0),0), dc=D.days.slice(-14).map(d=>vs.reduce((a,s)=>a+D.daily_cost[s][d],0));
   h += card("var(--up)","API value · 30d", usd(tot),
@@ -1453,7 +1811,7 @@ function renderCards(){
       const p5=L.primary.used_percent, pw=L.secondary?L.secondary.used_percent:null;
       h += `<div class="card"><div class="lbl"><span class="dot" style="background:${C["Codex"]}"></span>Codex · 5h / wk</div>
         <div class="big">${Math.round(p5)}%${pw!=null?`<span class="sub2"> / ${Math.round(pw)}%</span>`:""}</div>
-        <div class="small">${resetText(L.primary)||"used"}</div>${bar(p5)}${pw!=null?bar(pw):""}</div>`;
+        <div class="small">${resetText(L.primary)||"used"}${codexPace()}</div>${bar(p5)}${pw!=null?bar(pw):""}</div>`;
     } else h += card("Codex","Codex · 7d",fmt(D.week["Codex"]),"no rate-limit report yet");
   }
   const others=vs.filter(s=>s!=="Claude Code"&&s!=="Codex");
@@ -1475,14 +1833,19 @@ Chart.defaults.font.family = "JetBrains Mono, monospace";
 Chart.defaults.font.size = 10.5;
 let metric="tokens";
 const mfmt = v => metric==="cost" ? usd(v) : metric==="commits" ? String(Math.round(v)) : fmt(v);
-const VIEWS = {
-  hourly:{title:"Hourly · last 48h", keys:D.hours, src:D.hourly, csrc:D.hourly_cost, t0:D.hour0, step:3600,
+const hourView = n => ({title:`Hourly · last ${n}h`, keys:D.hours.slice(-n), src:D.hourly, csrc:D.hourly_cost,
+    t0:D.hour0+(D.hours.length-Math.min(n,D.hours.length))*3600, step:3600,
     label:k=>{const h=k.slice(11); return h==="00" ? k.slice(8,10)+"/"+k.slice(5,7) : h+":00";},
-    tip:k=>`${k.slice(8,10)}/${k.slice(5,7)} ${k.slice(11)}:00–${k.slice(11)}:59`},
-  daily:{title:"Daily · last 30d", keys:D.days, src:D.daily, csrc:D.daily_cost, t0:D.day0, step:86400,
-    label:k=>k.slice(8,10)+"/"+k.slice(5,7), tip:k=>k}
+    tip:k=>`${k.slice(8,10)}/${k.slice(5,7)} ${k.slice(11)}:00–${k.slice(11)}:59`});
+const dayView = n => ({title:`Daily · last ${n}d`, keys:D.days.slice(-n), src:D.daily, csrc:D.daily_cost,
+    t0:D.day0+(D.days.length-Math.min(n,D.days.length))*86400, step:86400,
+    label:k=>k.slice(8,10)+"/"+k.slice(5,7), tip:k=>{const d=new Date(k+"T12:00:00"); return `${DAYS[(d.getDay()+6)%7]} ${k.slice(8,10)}/${k.slice(5,7)}`;}});
+const VIEWS = {
+  h24:hourView(24), h48:hourView(48), h72:hourView(72),
+  d7:dayView(7), d14:dayView(14), daily:dayView(30)
 };
-let view="hourly";
+const isDaily = v => !v.startsWith("h");
+let view = VIEWS[P.view] ? P.view : "h48";
 const marks = {id:"marks", beforeDatasetsDraw(ch){
   const V=VIEWS[view], xs=ch.scales.x, {top,bottom,left,right}=ch.chartArea, ctx=ch.ctx, n=V.keys.length;
   const w=(xs.getPixelForValue(n-1)-xs.getPixelForValue(0))/Math.max(n-1,1);
@@ -1503,11 +1866,18 @@ const marks = {id:"marks", beforeDatasetsDraw(ch){
 }};
 const colorOf = s => { const c=C[s]||"#999"; return c.startsWith("var(") ? css(c) : c; };
 function dataFor(v){const V=VIEWS[v];
-  if(metric==="commits"){ const g=gitStats(), src=v==="hourly"?g.hourly:g.daily;
+  if(metric==="commits"){ const g=gitStats(), src=isDaily(v)?g.daily:g.hourly;
     return {labels:V.keys.map(V.label), datasets:[["With AI",0,css("var(--accent)")],["Without AI",1,"#5f5f5f"]].map(([label,i,col])=>
       ({label,data:V.keys.map(k=>(src[k]||[0,0])[i]),backgroundColor:col,borderRadius:2,maxBarThickness:24}))}; }
-  const src=metric==="cost"?V.csrc:V.src; return {labels:V.keys.map(V.label),
-  datasets:VIS().map(s=>({label:s,data:V.keys.map(k=>src[s][k]),backgroundColor:colorOf(s),borderRadius:2,maxBarThickness:24}))};}
+  const src=metric==="cost"?V.csrc:V.src;
+  const ds=VIS().map(s=>({label:s,data:V.keys.map(k=>src[s][k]),backgroundColor:colorOf(s),borderRadius:2,maxBarThickness:24}));
+  const T=(D.forecast||{}).today;
+  if(isDaily(v) && T && T[metric]){
+    const today=V.keys.length-1, actual=VIS().reduce((a,s)=>a+src[s][V.keys[today]],0), proj=VIS().reduce((a,s)=>a+(T[metric][s]||0),0);
+    if(proj>actual) ds.push({label:"Projected rest of today",data:V.keys.map((k,i)=>i===today?proj-actual:0),
+      backgroundColor:"rgba(255,255,255,.08)",borderColor:"rgba(255,255,255,.45)",borderWidth:{top:1,left:1,right:1,bottom:0},borderRadius:2,maxBarThickness:24});
+  }
+  return {labels:V.keys.map(V.label), datasets:ds};}
 const chart = new Chart(document.getElementById("chart"),{type:"bar", data:dataFor(view), plugins:[marks],
   options:{responsive:true,maintainAspectRatio:false,
     layout:{padding:{top:4,right:2,bottom:0,left:0}},
@@ -1521,22 +1891,25 @@ function renderLegend(){
   if(metric==="commits" && !gitOn()){ metric="tokens"; document.querySelectorAll("#metricseg button").forEach(x=>x.classList.toggle("on",x.dataset.m==="tokens")); }
   if(metric==="commits"){ $("#legend").innerHTML=`<span><i class="swatch" style="background:var(--accent)"></i>With AI</span><span><i class="swatch" style="background:#5f5f5f"></i>Without AI</span>`+
     `<span><i class="swatch-limit"></i>limit hit</span><span><i class="swatch-out"></i>incident</span>`; return; }
-  $("#legend").innerHTML =
+  $("#legend").innerHTML = (isDaily(view)&&(D.forecast||{}).today&&(D.forecast.today||{}).frac?`<span><i class="swatch" style="background:rgba(255,255,255,.12);outline:1px solid rgba(255,255,255,.45)"></i>projected today</span>`:"") +
   VIS().map(s=>`<span><i class="swatch" style="background:${C[s]}"></i>${esc(s)}</span>`).join("") +
   `<span><i class="swatch-limit"></i>limit hit</span><span><i class="swatch-out"></i>incident</span>`; }
 renderLegend();
-document.querySelectorAll("#viewseg button").forEach(b=>b.onclick=()=>{
-  view=b.dataset.v; document.querySelectorAll("#viewseg button").forEach(x=>x.classList.toggle("on",x===b));
+function setView(v){
+  view=v; P.view=v; savePrefs();
+  document.querySelectorAll("#viewseg button").forEach(x=>{ const on=x.dataset.v===v; x.classList.toggle("on",on); x.setAttribute("aria-selected",String(on)); });
   document.getElementById("charttitle").textContent=VIEWS[view].title;
-  chart.data=dataFor(view); chart.update();
-});
+  renderLegend(); chart.data=dataFor(view); chart.update();
+}
+document.querySelectorAll("#viewseg button").forEach(b=>b.onclick=()=>setView(b.dataset.v));
+document.querySelectorAll("#viewseg button").forEach(x=>{ const on=x.dataset.v===view; x.classList.toggle("on",on); x.setAttribute("aria-selected",String(on)); });
+document.getElementById("charttitle").textContent=VIEWS[view].title;
 document.querySelectorAll("#metricseg button").forEach(b=>b.onclick=()=>{
   metric=b.dataset.m; document.querySelectorAll("#metricseg button").forEach(x=>x.classList.toggle("on",x===b));
   renderLegend(); chart.data=dataFor(view); chart.update();
 });
 
 /* ---- heatmap ---- */
-const DAYS=["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
 function renderHeat(){
   const vs=VIS(), grid=DAYS.map((_,d)=>Array.from({length:24},(_,hr)=>vs.reduce((a,s)=>a+(((D.heat_by[s]||[])[d]||[])[hr]||0),0)));
   const flat=grid.flat(), max=Math.max(1,...flat), total=flat.reduce((a,b)=>a+b,0);
@@ -1562,7 +1935,7 @@ renderHeat();
 function renderTables(){
 document.getElementById("sessions").innerHTML =
   `<tr><th>Session</th><th>Started</th><th class="r">Length</th><th class="r">Calls</th><th class="r">Tokens</th><th class="r">Cost</th><th>Model</th></tr>` +
-  (D.sessions.filter(s=>on(s.source)).map(s=>`<tr><td class="trunc" title="${esc(s.project)}"><span class="dot" style="background:${C[s.source]};margin-right:7px"></span>${esc(s.project)}</td>
+  (D.sessions.map((s,i)=>[s,i]).filter(([s])=>on(s.source)).map(([s,i])=>`<tr class="click" tabindex="0" data-i="${i}" title="Click for details"><td class="trunc"><span class="dot" style="background:${C[s.source]};margin-right:7px"></span>${esc(pname(s.project))}</td>
    <td>${when(s.start)}</td><td class="r">${s.source==="Hermes"?"—":dur(s.end-s.start)}</td><td class="r">${s.calls}</td>
    <td class="r">${fmt(s.tokens)}</td><td class="r">${s.cost?usd(s.cost):"—"}</td><td class="trunc" title="${esc(s.model)}">${esc(s.model)}</td></tr>`).join("") || `<tr><td>No sessions yet</td></tr>`);
 
@@ -1574,8 +1947,49 @@ document.getElementById("models").innerHTML =
 const gs=gitOn()?gitStats():null;
 document.getElementById("projects").innerHTML =
   (gs?`<tr><th>Project</th><th class="r">Tokens</th><th class="r">Cost</th><th class="r" title="commits in the last 30 days (with AI)">Commits</th></tr>`:"") +
-  (D.projects.filter(([,,,srcs])=>srcs.some(on)).map(([p,t,cost,srcs])=>`<tr><td class="trunc" title="${esc(p)}">${srcs.map(s=>`<span class="dot" style="background:${C[s]};margin-right:3px"></span>`).join("")}<span style="margin-left:4px">${esc(p)}</span></td><td class="r">${fmt(t)}</td><td class="r">${cost?usd(cost):"—"}</td>${gs?`<td class="r" title="${gs.repo[p]?gs.repo[p][1]+" with AI":"no git commits found"}">${gs.repo[p]?gs.repo[p][0]:"—"}</td>`:""}</tr>`).join("") || `<tr><td>No data yet</td></tr>`);
+  (D.projects.filter(([,,,srcs])=>srcs.some(on)).map(([p,t,cost,srcs])=>`<tr><td class="trunc" title="${esc(pname(p))}">${srcs.map(s=>`<span class="dot" style="background:${C[s]};margin-right:3px"></span>`).join("")}<span style="margin-left:4px">${esc(pname(p))}</span></td><td class="r">${fmt(t)}</td><td class="r">${cost?usd(cost):"—"}</td>${gs?`<td class="r" title="${gs.repo[p]?gs.repo[p][1]+" with AI":"no git commits found"}">${gs.repo[p]?gs.repo[p][0]:"—"}</td>`:""}</tr>`).join("") || `<tr><td>No data yet</td></tr>`);
+document.querySelectorAll("#sessions tr.click").forEach(r=>{
+  r.onclick=()=>openSession(+r.dataset.i);
+  r.onkeydown=e=>{ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); openSession(+r.dataset.i); } };
+});
+renderAdvice();
 }
+
+/* ---- model advice ---- */
+function renderAdvice(){
+  const el=$("#tip"), tot=VIS().reduce((a,s)=>a+D.cost30[s],0);
+  const by={}; for(const a of (D.advice||[]).filter(a=>on(a.source))){ const k=a.from+">"+a.to; const b=by[k]||(by[k]={from:a.from,to:a.to,calls:0,small:0,cs:0,ca:0}); b.calls+=a.calls; b.small+=a.small; b.cs+=a.cost_small; b.ca+=a.cost_alt; }
+  const best=Object.values(by).map(b=>({...b,save:b.cs-b.ca})).filter(b=>b.save>=0.5 && b.small/b.calls>=0.2).sort((a,b)=>b.save-a.save)[0];
+  if(!best){ el.hidden=true; return; }
+  el.hidden=false;
+  el.innerHTML=`💡 <b>${Math.round(best.small/best.calls*100)}%</b> of ${esc(best.from)} requests were small: on ${esc(best.to)} ≈<b>${usd(best.save)}</b> less`+(tot?` (${Math.round(best.save/tot*100)}%)`:"");
+  el.title=`${best.small} of ${best.calls} ${best.from} requests in the last 30 days wrote under 800 tokens. Priced at ${best.to} rates they'd have cost ${usd(best.ca)} instead of ${usd(best.cs)}. Worth trying the smaller model for quick edits and questions.`;
+}
+
+/* ---- session drill-down ---- */
+const modal=$("#modal"), mbox=$("#mbox"); let lastFocus=null;
+function closeSession(){ modal.hidden=true; if(lastFocus) lastFocus.focus(); }
+modal.addEventListener("click",e=>{ if(e.target===modal) closeSession(); });
+document.addEventListener("keydown",e=>{ if(e.key==="Escape" && !modal.hidden) closeSession(); });
+function openSession(i){
+  const s=D.sessions[i]; if(!s) return;
+  lastFocus=document.activeElement;
+  const tl=s.timeline||[], W=720, H=120, n=Math.max(tl.length,1), bw=Math.max(1,W/n-1);
+  const max=Math.max(1,...tl.map(x=>x[1]+x[2]+x[3]));
+  const bars=tl.map((x,k)=>{ const v=x[1]+x[2]+x[3], h=Math.max(1,v/max*(H-4)), d=new Date(x[0]*1000);
+    return `<rect x="${(k*W/n).toFixed(1)}" y="${(H-h).toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" fill="${C[s.source]&&C[s.source].startsWith("var(")?css(C[s.source]):C[s.source]}"><title>${pad(d.getHours())}:${pad(d.getMinutes())} · in ${fmt(x[1])} · out ${fmt(x[2])} · cache write ${fmt(x[3])} · cache read ${fmt(x[4])} · ${usd(x[5])}</title></rect>`; }).join("");
+  const tools=Object.entries(s.tools||{}).sort((a,b)=>b[1]-a[1]).slice(0,10), tmax=Math.max(1,...tools.map(t=>t[1]));
+  mbox.innerHTML=`<div class="dh"><h2 id="mtitle"><span class="dot" style="background:${C[s.source]};margin-right:8px"></span>${esc(pname(s.project))}</h2><button class="x" id="mclose" aria-label="Close">✕</button></div>
+    <div class="small">${esc(s.source)} · ${when(s.start)} → ${when(s.end)}${s.source==="Hermes"?"":` · ${dur(s.end-s.start)}`}</div>
+    <div class="mstats"><div class="small">Requests<b>${s.calls}</b></div><div class="small">Tokens<b>${fmt(s.tokens)}</b></div>
+      <div class="small">API value<b>${s.cost?usd(s.cost):"—"}</b></div><div class="small">Cache hit<b>${s.cache_hit==null?"—":s.cache_hit+"%"}</b></div>
+      <div class="small">Per request<b>${fmt(Math.round(s.tokens/Math.max(1,s.calls)))}</b></div></div>
+    <h3>Tokens per request</h3><svg class="tl" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${bars}</svg>
+    <h3>Models</h3><div class="small">${(s.models||[s.model]).map(esc).join(" · ")}</div>
+    ${tools.length?`<h3>Claude Code tools used</h3><div class="toolbars">${tools.map(([t,c])=>`<span>${esc(t)}</span><i style="width:${(c/tmax*100).toFixed(0)}%"></i><em>${c}</em>`).join("")}</div>`:""}`;
+  modal.hidden=false; $("#mclose").onclick=closeSession; $("#mclose").focus();
+}
+
 renderTables();
 
 /* ---- Claude status (embedded, then live) ---- */
@@ -1679,7 +2093,7 @@ function openDrawer(open){
 gear.onclick=e=>{ e.stopPropagation(); openDrawer(drawer.hidden); };
 $("#dclose").onclick=()=>{ openDrawer(false); gear.focus(); };
 document.addEventListener("keydown",e=>{ if(e.key==="Escape" && !drawer.hidden){ openDrawer(false); gear.focus(); } });
-document.addEventListener("click",e=>{ if(!drawer.hidden && !drawer.contains(e.target)) openDrawer(false); });
+document.addEventListener("click",e=>{ if(e.isTrusted && !drawer.hidden && !drawer.contains(e.target)) openDrawer(false); });
 function sw(id,label,checked,disabled,note){
   return `<label class="sw"><span><span>${label}</span>${note?`<small>${note}</small>`:""}</span><input type="checkbox" id="${id}" ${checked?"checked":""} ${disabled?"disabled":""}><i></i></label>`;
 }
@@ -1696,7 +2110,9 @@ function renderSettings(){
     $("#s-gitmine").onchange=e=>{ P.gitMine=e.target.checked; changed(); };
   }
   $("#s-display").innerHTML = sw("s-prices","Crypto prices", P.prices && D.show_prices, !D.show_prices, D.show_prices?"":"turned off in the settings file")
-    + sw("s-anim","Moving background", P.animate, false, matchMedia("(prefers-reduced-motion: reduce)").matches?"your system has reduced motion on":"");
+    + sw("s-anim","Moving background", P.animate, false, matchMedia("(prefers-reduced-motion: reduce)").matches?"your system has reduced motion on":"")
+    + sw("s-priv","Screenshot mode", P.privacy, false, "hides project and repo names");
+  $("#s-priv").onchange=e=>{ P.privacy=e.target.checked; changed(); };
   $("#s-prices").onchange=e=>{ P.prices=e.target.checked; changed(); if(P.prices) livePrices(); };
   $("#s-anim").onchange=e=>{ P.animate=e.target.checked; changed(); };
   const box=$("#s-coins");
@@ -1714,18 +2130,43 @@ function renderCmd(){
   const parts=[`--set coins=${P.coins.map(id=>spec[id]||id.toUpperCase()).join(",")||'""'}`,
     `--set 'hidden_tools=${JSON.stringify(P.hidden)}'`, `--set theme.animate_background=${P.animate}`];
   if(D.git.enabled) parts.push(`--set git.author=${P.gitMine?"me":"all"}`);
+  parts.push(`--set screenshot_mode=${P.privacy}`);
   if(D.show_prices) parts.push(`--set show_prices=${P.prices}`);
   $("#s-cmd").textContent = "python3 usage.py " + parts.join(" ");
 }
 function changed(redrawPanel=true){
   savePrefs(); renderCards(); renderLegend(); chart.data=dataFor(view); chart.update();
-  renderHeat(); renderTables(); renderCoins(D.prices);
+  renderSub(); renderHeat(); renderTables(); renderCoins(D.prices);
   if(redrawPanel) renderSettings(); else renderCmd();
 }
 $("#s-copy").onclick=async e=>{
   e.stopPropagation(); const t=$("#s-cmd").textContent, b=e.currentTarget;
   try{ await navigator.clipboard.writeText(t); }catch(err){ const r=document.createRange(); r.selectNodeContents($("#s-cmd")); const sel=getSelection(); sel.removeAllRanges(); sel.addRange(r); document.execCommand("copy"); }
   b.textContent="Copied"; setTimeout(()=>b.textContent="Copy command",1500);
+};
+function download(name, text, type){
+  const a=document.createElement("a"); a.href=URL.createObjectURL(new Blob([text],{type})); a.download=name;
+  document.body.appendChild(a); a.click(); setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); },500);
+}
+const stamp=()=>new Date().toISOString().slice(0,10);
+$("#x-csv").onclick=e=>{
+  e.stopPropagation();
+  const vs=VIS(), g=gitOn()?gitStats():null, q=v=>/[",\n]/.test(v)?`"${String(v).replace(/"/g,'""')}"`:v;
+  const head=["date",...vs.flatMap(s=>[`${s} tokens`,`${s} cost_usd`]),...(g?["commits","commits_with_ai"]:[])];
+  const rows=D.days.map(d=>[d,...vs.flatMap(s=>[D.daily[s][d],D.daily_cost[s][d].toFixed(4)]),...(g?[g.daily[d][0]+g.daily[d][1],g.daily[d][0]]:[])]);
+  download(`build-commit-pro-daily-${stamp()}.csv`,[head,...rows].map(r=>r.map(q).join(",")).join("\n"),"text/csv");
+};
+$("#x-json").onclick=e=>{
+  e.stopPropagation();
+  const vs=VIS(), g=gitOn()?gitStats():null;
+  const out={tool:"Build & Commit Pro Tracker", version:D.version, generated:D.generated, tools:vs,
+    daily:D.days.map(d=>({date:d, ...Object.fromEntries(vs.map(s=>[s,{tokens:D.daily[s][d],cost_usd:+D.daily_cost[s][d].toFixed(4)}]))})),
+    models:D.models.filter(([s])=>on(s)).map(([s,m,i,o,w,r,c])=>({tool:s,model:m,input:i,output:o,cache_write:w,cache_read:r,cost_usd:+c.toFixed(4)})),
+    projects:D.projects.filter(([,,,srcs])=>srcs.some(on)).map(([p,t,c,srcs])=>({project:pname(p),tokens:t,cost_usd:+c.toFixed(4),tools:srcs})),
+    sessions:D.sessions.filter(s=>on(s.source)).map(s=>({tool:s.source,project:pname(s.project),start:new Date(s.start*1000).toISOString(),end:new Date(s.end*1000).toISOString(),requests:s.calls,tokens:s.tokens,cost_usd:+s.cost.toFixed(4),model:s.model,claude_code_tools:s.tools})),
+    commits:g?{total:g.n,with_ai:g.ai,lines_added:g.added,lines_deleted:g.deleted,by_tool:g.tool,by_repo:Object.fromEntries(Object.entries(g.repo).map(([k,v])=>[pname(k),{commits:v[0],with_ai:v[1]}]))}:null,
+    forecast:D.forecast, screenshot_mode:P.privacy};
+  download(`build-commit-pro-${stamp()}.json`,JSON.stringify(out,null,2),"application/json");
 };
 $("#s-reset").onclick=e=>{ e.stopPropagation(); P={...DEF, hidden:[...DEF.hidden], coins:[...DEF.coins]}; try{ localStorage.removeItem(PKEY); }catch(err){} changed(); };
 
@@ -1869,6 +2310,9 @@ def main():
     ap.add_argument("--test-alert", action="store_true", help="send a test desktop notification")
     ap.add_argument("--offline", action="store_true", help="skip status and price fetches")
     ap.add_argument("--inspect-hermes", action="store_true", help="show the Hermes database layout")
+    ap.add_argument("--export", metavar="FOLDER", nargs="?", const=".", help="write every request and commit to CSV + a JSON summary")
+    ap.add_argument("--menubar", action="store_true", help="print a SwiftBar/xbar/Argos menu (used by the menu bar plugin)")
+    ap.add_argument("--install-menubar", metavar="FOLDER", nargs="?", const="", help="optional: add the menu bar meter to SwiftBar/xbar/Argos")
     a = ap.parse_args()
     if a.inspect_hermes:
         return inspect_hermes()
@@ -1876,6 +2320,10 @@ def main():
         return install()
     if a.uninstall:
         return uninstall()
+    if a.menubar:
+        return menubar(settings())
+    if a.install_menubar is not None:
+        return install_menubar(a.install_menubar or None)
     if a.test_alert:
         return notify("Build & Commit Pro Tracker", "Test notification: alerts are working.")
     for opt, label in (("coingecko_key", "CoinGecko"), ("cmc_key", "CoinMarketCap")):
@@ -1908,7 +2356,8 @@ def main():
     status, incidents = (None, []) if a.offline else collect_status()
     prices = None if a.offline else collect_prices(cfg)
     counts = {"Claude Code": claude, "Codex": codex, "Hermes": hermes, "Gemini CLI": gemini, "OpenCode": opencode, "Aider": aider}
-    found = " · ".join(f"{k}: {len(v)}" for k, v in counts.items() if v or k in ("Claude Code", "Codex"))
+    found = " · ".join((f"Hermes: {HERMES_TRACKED[0]} session{'s' if HERMES_TRACKED[0] != 1 else ''}" + (f" (+{len(v)} updated)" if v else "")) if k == "Hermes"
+                       else f"{k}: {len(v)}" for k, v in counts.items() if v or k in ("Claude Code", "Codex") or (k == "Hermes" and HERMES_TRACKED[0]))
     if repos:
         found += f" · commits: {len(commits)} in {len(repos)} repo{'s' if len(repos) != 1 else ''}"
     print(f"v{VERSION} · {datetime.now():%H:%M} · {found} · limit hits: {len(claude_ev) + len(codex_ev)} · "
@@ -1924,6 +2373,9 @@ def main():
     check_alerts(con, agg, cfg)
     out = render(agg, cfg)
     print(f"Dashboard: {out}")
+    if a.export:
+        for p in export_data(con, cfg, a.export):
+            print(f"Exported: {p}")
     if not a.no_open:
         webbrowser.open(out.as_uri())
 
